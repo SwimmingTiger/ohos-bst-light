@@ -1,16 +1,42 @@
 /*
  * self-sign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
  *
+ * ELF 解析做了健壮化 (字节读取 + 边界检查,
+ * 不再依赖未对齐指针解引用, 并校验 e_shentsize/SHT 越界).
+ *
  * 用法:
  *     cc self-sign.c -o self-sign
- *     ./self-sign <input_elf> [output_elf]
+ *     ./self-sign <input_elf> [output_elf] [--force] [--strip]
  *         缺省 output 时, inplace 改写 input.
+ *         --force : 若已含 .codesign 段, 先剥离再重签
+ *         --strip : 仅剥离 .codesign 段, 不做签名
+ *
+ * ─────────────────────────────────────────────────────────────
+ * 函数划分说明:
+ *
+ * 一、签名必需的算法核心 (缺一不可, 组成 sign_elf 主流程):
+ *     sha256 / merkle_root_hash / build_descriptor /
+ *     inject_codesign_section / sign_elf
+ *
+ * 二、ELF 预清洗 / 标准化动作 (并非签名所必需, 是签名前的
+ *      "把 ELF 恢复到干净、可签状态" 的辅助动作, 已独立成函数,
+ *      签名流程只有 --force 时才按需调用):
+ *     parse_elf_header     — 校验并解析 ELF64 header (预检, 只读)
+ *     find_section_by_name — 按名字在 SHT 里找段 (预检, 只读)
+ *     has_codesign_section — 检测是否已含 .codesign 段 (预检, 只读)
+ *     strip_codesign       — 剥离已有 .codesign 段并重建 SHT/shstrtab
+ *                            (标准化; 纯加签模式下不执行)
+ *
+ * 三、文件 I/O 层 (与签名算法无关的健壮性):
+ *     sign_file_atomic     — 临时文件 + rename 原子落盘, 保留原权限位
  */
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ─────────────────────────── SHA-256 ─────────────────────────── */
 /* 按 FIPS 180-4 (Secure Hash Standard, 公开规范) 自实现 */
@@ -42,7 +68,7 @@ static const uint32_t SHA256_K[64] = {
 #define SHA_CH(e,f,g)  (((e) & (f)) ^ ((~(e)) & (g)))                /* Ch */
 #define SHA_MAJ(a,b,c) (((a) & (b)) ^ ((a) & (c)) ^ ((b) & (c)))    /* Maj */
 
-/* FIPS 180-4 §5.3.3: SHA-256 的 8 个初始哈希值 H (κ = floor(2^32 * sin(i)) 的前32位) */
+/* FIPS 180-4 §5.3.3: SHA-256 的 8 个初始哈希值 H */
 static void sha256_init(SHA256_CTX *c) {
     c->bitlen = 0; c->buflen = 0;
     c->state[0]=0x6a09e667; c->state[1]=0xbb67ae85; c->state[2]=0x3c6ef372; c->state[3]=0xa54ff53a;
@@ -54,7 +80,6 @@ static void sha256_block(SHA256_CTX *c, const uint8_t *p) {
     uint32_t w[64];
     uint32_t a, b, cc, d, e, f, g, h, t1, t2;
     int i;
-    /* §5.1.1: 把 16 个字做大端解析为 W0..W15; §6.2.2 步骤1: W16..W63 = σ1(W[i-2]) + W[i-7] + σ0(W[i-15]) + W[i-16] */
     for (i = 0; i < 16; i++) {
         w[i] = ((uint32_t)p[i*4]) << 24 | ((uint32_t)p[i*4+1]) << 16
              | ((uint32_t)p[i*4+2]) << 8 | ((uint32_t)p[i*4+3]);
@@ -62,16 +87,13 @@ static void sha256_block(SHA256_CTX *c, const uint8_t *p) {
     for (; i < 64; i++) {
         w[i] = SHA_SMALL_S1(w[i-2]) + w[i-7] + SHA_SMALL_S0(w[i-15]) + w[i-16];
     }
-    /* §6.2.2 步骤2: 初始化工作变量为当前 state */
     a = c->state[0]; b = c->state[1]; cc = c->state[2]; d = c->state[3];
     e = c->state[4]; f = c->state[5]; g = c->state[6]; h = c->state[7];
-    /* 步骤3: 64 轮压缩; T1 = h + Σ1(e) + Ch(e,f,g) + K[i] + W[i]; T2 = Σ0(a) + Maj(a,b,c) */
     for (i = 0; i < 64; i++) {
         t1 = h + SHA_BIG_S1(e) + SHA_CH(e, f, g) + SHA256_K[i] + w[i];
         t2 = SHA_BIG_S0(a) + SHA_MAJ(a, b, cc);
         h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
     }
-    /* 步骤4: 把工作变量回加进 state */
     c->state[0] += a; c->state[1] += b; c->state[2] += cc; c->state[3] += d;
     c->state[4] += e; c->state[5] += f; c->state[6] += g; c->state[7] += h;
 }
@@ -94,7 +116,6 @@ static void sha256_final(SHA256_CTX *c, uint8_t out[32]) {
     while (i < 56) c->buf[i++] = 0;
     for (i = 0; i < 8; i++) c->buf[56 + i] = (uint8_t)(bits >> (56 - 8*i));
     sha256_block(c, c->buf);
-    /* 输出: 8 个 state 字大端 */
     for (i = 0; i < 8; i++) {
         out[i*4]   = (uint8_t)(c->state[i] >> 24);
         out[i*4+1] = (uint8_t)(c->state[i] >> 16);
@@ -107,39 +128,351 @@ static void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
     SHA256_CTX c; sha256_init(&c); sha256_update(&c, data, len); sha256_final(&c, out);
 }
 
-/* ─────────────────────────── 工具 ─────────────────────────── */
-static int read_file(const char *path, uint8_t **out, size_t *outlen) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { perror(path); return -1; }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); return -1; }
-    uint8_t *buf = malloc(sz > 0 ? sz : 1);
-    if (!buf) { fclose(f); return -1; }
-    if (sz > 0 && fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
-    fclose(f);
-    *out = buf; *outlen = (size_t)sz; return 0;
+/* ─────────────────────────── 字节读写工具 ─────────────────────────── */
+/* 小端读取/写入: 一律走 memcpy/显式移位, 不做未对齐指针解引用, 保证在
+ * 任何对齐要求的平台 (ARM 等) 上都安全且可移植. */
+static uint16_t read_u16(const uint8_t *p, size_t len, size_t off) {
+    uint16_t v = 0;
+    if (off + 2 <= len) { uint8_t b[2]; memcpy(b, p + off, 2); v = (uint16_t)b[0] | ((uint16_t)b[1] << 8); }
+    return v;
 }
-static int write_file(const char *path, const uint8_t *data, size_t len) {
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror(path); return -1; }
-    if (len && fwrite(data, 1, len, f) != len) { fclose(f); return -1; }
-    fclose(f); return 0;
+static uint32_t read_u32(const uint8_t *p, size_t len, size_t off) {
+    uint32_t v = 0;
+    if (off + 4 <= len) { uint8_t b[4]; memcpy(b, p + off, 4);
+        v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24); }
+    return v;
+}
+static uint64_t read_u64(const uint8_t *p, size_t len, size_t off) {
+    uint64_t v = 0;
+    if (off + 8 <= len) { uint8_t b[8]; memcpy(b, p + off, 8);
+        for (int i = 0; i < 8; i++) v |= (uint64_t)b[i] << (8 * i); }
+    return v;
+}
+static void write_u16(uint8_t *p, size_t off, uint16_t v) {
+    p[off] = v & 0xff; p[off+1] = (v >> 8) & 0xff;
+}
+static void write_u32(uint8_t *p, size_t off, uint32_t v) {
+    p[off]=v&0xff; p[off+1]=(v>>8)&0xff; p[off+2]=(v>>16)&0xff; p[off+3]=(v>>24)&0xff;
+}
+static void write_u64(uint8_t *p, size_t off, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[off+i] = (uint8_t)(v >> (8 * i));
 }
 
-/* 小端多字节写入 */
-static void put_u32le(uint8_t *p, uint32_t v) { p[0]=v&0xff; p[1]=(v>>8)&0xff; p[2]=(v>>16)&0xff; p[3]=(v>>24)&0xff; }
-static void put_u64le(uint8_t *p, uint64_t v) { for (int i=0;i<8;i++) p[i]=(v>>(8*i))&0xff; }
+static uint64_t align_up(uint64_t v, uint64_t a) { return ((v + a - 1) / a) * a; }
 
-/* ─────────────────────── merkle 树根哈希 ─────────────────────── */
+/* ─────────────────────────── ELF 常量 ─────────────────────────── */
+static const size_t DESC_SIZE = 256;
+static const size_t PAGE_SIZE = 4096;
+static const uint32_t FLAG_SELF_SIGN = 0x10;
+static const uint32_t FS_VERITY_DESCRIPTOR_TYPE = 1;
+
+/* ELF64 header 字段偏移 */
+static const size_t E_SHOFF = 0x28;
+static const size_t E_SHENTSIZE = 0x3a;
+static const size_t E_SHNUM = 0x3c;
+static const size_t E_SHSTRNDX = 0x3e;
+
+/* 显式声明为恰好 10 字节 (9 字符 + NUL): 若用字符串字面量加 sizeof,
+ * 编译器会隐式追加终止 NUL 得到 11, 会导致注入/剥离出的 shstrtab
+ * 长度差 1 字节. */
+static const char CODESIGN_NAME[10] = ".codesign\0";
+
+/* ─────────────────── ELF 预清洗/标准化 (非签名必需) ─────────────────── */
+
 /*
- * 与上游 merkle_tree_builder.cpp::RunHashTask 精确等价:
- *   - 对含段产物按原偏移分页, 每页 4096B, 末页补0
- *   - 段所在页(csOff/4096 .. (csOff+csLen)/4096)的叶哈希全填0, 不做SHA256
- *   - 上推: 当前哈希层每 4096B(=128个哈希)一页再 SHA-256, 末页补0
- *   - 单页即根; 顶层(packed<=4096)整页补0再哈希即根
- * 内存: cur 始终指向"当前哈希层", owns 标记是否需 free.
+ * parse_elf_header — 校验并解析 ELF64 header (只读预检).
+ *
+ * 这不是签名算法的一部分, 而是签名/剥离共用的"先决条件检查":
+ *  - 校验魔数 \x7fELF + ELFCLASS64
+ *  - 校验 e_shentsize == 64 (必须为 64; 旧版 C 实现漏掉此项, 非 64 字节
+ *    的 SHT 条目会直接导致后续计算错误)
+ *  - 校验 SHT 不越界 (checked_add 语义), e_shstrndx < e_shnum
+ * 返回 0 表示通过, 输出 e_shoff/e_shnum/e_shstrndx; 返回 -1 表示不是
+ * 可处理的 ELF64.
+ */
+static int parse_elf_header(const uint8_t *elf, size_t elf_len,
+                            uint64_t *e_shoff, uint16_t *e_shnum,
+                            uint16_t *e_shstrndx) {
+    if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
+        fprintf(stderr, "error: not ELF64\n");
+        return -1;
+    }
+    uint64_t shoff = read_u64(elf, elf_len, E_SHOFF);
+    uint16_t shentsize = read_u16(elf, elf_len, E_SHENTSIZE);
+    uint16_t shnum = read_u16(elf, elf_len, E_SHNUM);
+    uint16_t shstrndx = read_u16(elf, elf_len, E_SHSTRNDX);
+    if (shentsize != 64 || shoff == 0 || shnum == 0 || (uint64_t)shstrndx >= (uint64_t)shnum) {
+        fprintf(stderr, "error: ELF has no usable section header table\n");
+        return -1;
+    }
+    /* SHT 越界检查: e_shoff + e_shnum*64 必须落在文件内 (对应 checked_add + 比较) */
+    if (shoff > elf_len || shnum > (elf_len - shoff) / 64) {
+        fprintf(stderr, "error: section header table out of bounds\n");
+        return -1;
+    }
+    *e_shoff = shoff;
+    *e_shnum = shnum;
+    *e_shstrndx = shstrndx;
+    return 0;
+}
+
+/*
+ * find_section_by_name — 在 SHT 中按名字找段 (只读预检).
+ *
+ * 先经 shstrtab entry 解析出字符串表位置并做越界检查, 再遍历所有段条目
+ * 比较 sh_name 指向的名字.
+ * 返回段条目在文件中的偏移 (即 e_shoff + idx*64), 未找到返回 -1.
+ */
+static int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
+                                    uint64_t e_shoff, uint16_t e_shnum,
+                                    uint16_t e_shstrndx, const char *name) {
+    size_t name_len = strlen(name) + 1; /* 含 NUL */
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
+    uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
+    if (shstr_off + shstr_sz > elf_len) return -1;
+    for (uint16_t i = 0; i < e_shnum; i++) {
+        size_t e = (size_t)e_shoff + (size_t)i * 64;
+        uint32_t name_off = read_u32(elf, elf_len, e);
+        if ((uint64_t)name_off + name_len <= shstr_sz) {
+            if (memcmp(elf + shstr_off + name_off, name, name_len) == 0) {
+                return (int64_t)e;
+            }
+        }
+    }
+    return -1;
+}
+
+/*
+ * has_codesign_section — 检测 ELF 是否已含 .codesign 段 (只读预检).
+ *
+ * 签名前先问一句"是不是已经签过", 由调用方决定:
+ *   - 纯加签模式: 已含则直接报"已签名"错误
+ *   - --force 模式: 已含则先走 strip_codesign 再签
+ */
+static int has_codesign_section(const uint8_t *elf, size_t elf_len) {
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return 0;
+    return find_section_by_name(elf, elf_len, e_shoff, e_shnum, e_shstrndx,
+                                CODESIGN_NAME) >= 0 ? 1 : 0;
+}
+
+/* strip 时 shstrtab 在新 SHT 中的索引: 若 .codesign 在 shstrtab 之前被删,
+ * shstrtab 的索引整体前移一位, 否则不变. */
+static uint16_t new_shstrndx(uint16_t old_shstrndx, size_t cs_idx) {
+    return cs_idx < old_shstrndx ? (uint16_t)(old_shstrndx - 1) : old_shstrndx;
+}
+
+/*
+ * strip_codesign — 剥离 .codesign 段, 重建 shstrtab 与 SHT (ELF 标准化).
+ *
+ * ⚠ 这是"预清洗/标准化"动作, 并非签名所必需: 签名算法本身只要求输入
+ * 是干净的 ELF64; 若输入已带 .codesign 段, 反复加签会累积畸形段.
+ * 只有 --force 才会调用它.
+ *
+ * 剥离步骤:
+ *   1. 定位 .codesign 段条目 → cs_idx
+ *   2. 从 shstrtab 中 drain 掉 ".codesign\0" (cs_name_off .. +10)
+ *   3. 新 SHT = 旧 SHT 去掉 cs_idx 条目
+ *   4. 文件截断到 cs_sec_off (段在文件中的偏移), 其后依次放新 shstrtab、
+ *      8B 对齐的新 SHT
+ *   5. 重写 shstrtab 条目偏移/大小 (注意 cs_idx 在 shstrtab 前后时索引调整)
+ *   6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len
+ *   7. 更新 header: e_shoff / e_shnum / e_shstrndx (仅 cs_idx < e_shstrndx 时 -1)
+ *
+ * 入参 *buf / *buf_len 会被原地改写 (可能 realloc).
+ * 返回 1 = 已剥离; 0 = 本来就没有 .codesign; -1 = 错误.
+ */
+static int strip_codesign(uint8_t **buf, size_t *buf_len) {
+    uint8_t *elf = *buf;
+    size_t elf_len = *buf_len;
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return -1;
+
+    int64_t cs_entry_off = find_section_by_name(elf, elf_len, e_shoff, e_shnum,
+                                                e_shstrndx, CODESIGN_NAME);
+    if (cs_entry_off < 0) return 0; /* 无 .codesign, 无需清洗 */
+    size_t cs_idx = ((size_t)cs_entry_off - (size_t)e_shoff) / 64;
+
+    /* 读 shstrtab 位置并做越界检查 */
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    size_t shstr_off = (size_t)read_u64(elf, elf_len, shstr_e + 24);
+    size_t shstr_sz = (size_t)read_u64(elf, elf_len, shstr_e + 32);
+    if (shstr_off + shstr_sz > elf_len) {
+        fprintf(stderr, "error: shstrtab out of bounds\n");
+        return -1;
+    }
+
+    /* 2. 新 shstrtab = 旧 shstrtab 删掉 ".codesign\0" */
+    uint32_t cs_name_off = read_u32(elf, elf_len, (size_t)cs_entry_off);
+    size_t cs_name_len = sizeof(CODESIGN_NAME); /* 10, 含 NUL */
+    size_t new_shstr_sz = shstr_sz;
+    uint8_t *new_shstr = malloc(shstr_sz);
+    if (!new_shstr) { fprintf(stderr, "error: out of memory\n"); return -1; }
+    memcpy(new_shstr, elf + shstr_off, shstr_sz);
+    if (cs_name_off + cs_name_len <= shstr_sz) {
+        memmove(new_shstr + cs_name_off, new_shstr + cs_name_off + cs_name_len,
+                shstr_sz - cs_name_off - cs_name_len);
+        new_shstr_sz -= cs_name_len;
+    }
+
+    /* 3. 新 SHT = 旧 SHT 去掉 cs_idx 条目 */
+    uint16_t new_shnum = e_shnum - 1;
+    size_t new_sht_bytes = (size_t)new_shnum * 64;
+    uint8_t *new_sht = malloc(new_sht_bytes);
+    if (!new_sht) { free(new_shstr); fprintf(stderr, "error: out of memory\n"); return -1; }
+    size_t dst = 0;
+    for (uint16_t i = 0; i < e_shnum; i++) {
+        if (i == cs_idx) continue;
+        memcpy(new_sht + dst, elf + (size_t)e_shoff + (size_t)i * 64, 64);
+        dst += 64;
+    }
+
+    /* 4. 截断到 .codesign 段文件偏移, 依次追加 新shstrtab / 8B对齐 新SHT */
+    size_t cs_sec_off = (size_t)read_u64(elf, elf_len, (size_t)cs_entry_off + 24);
+    size_t keep_len = cs_sec_off < elf_len ? cs_sec_off : elf_len;
+    size_t new_shstr_off = keep_len;
+    size_t new_sht_off = (size_t)align_up(new_shstr_off + new_shstr_sz, 8);
+    size_t new_total = new_sht_off + new_sht_bytes;
+
+    uint8_t *out = calloc(1, new_total ? new_total : 1);
+    if (!out) { free(new_shstr); free(new_sht); fprintf(stderr, "error: out of memory\n"); return -1; }
+    if (keep_len) memcpy(out, elf, keep_len);
+    memcpy(out + new_shstr_off, new_shstr, new_shstr_sz);
+    memcpy(out + new_sht_off, new_sht, new_sht_bytes);
+    free(new_shstr);
+    free(new_sht);
+
+    /* 5. 重写 shstrtab 条目: 新 shstr 位置/大小 (cs_idx 在 shstrtab 前后时索引不同) */
+    size_t shstr_entry_off_in_new = (size_t)new_shstrndx(e_shstrndx, cs_idx) * 64;
+    write_u64(out, new_sht_off + shstr_entry_off_in_new + 24, new_shstr_off);
+    write_u64(out, new_sht_off + shstr_entry_off_in_new + 32, new_shstr_sz);
+
+    /* 6. 所有 sh_name > cs_name_off 的段名偏移整体前移 cs_name_len */
+    for (uint16_t i = 0; i < new_shnum; i++) {
+        size_t e = new_sht_off + (size_t)i * 64;
+        uint32_t noff = read_u32(out, new_total, e);
+        if (noff > cs_name_off) write_u32(out, e, noff - (uint32_t)cs_name_len);
+    }
+
+    /* 7. 更新 header */
+    write_u64(out, E_SHOFF, new_sht_off);
+    write_u16(out, E_SHNUM, new_shnum);
+    if (cs_idx < e_shstrndx) write_u16(out, E_SHSTRNDX, e_shstrndx - 1);
+
+    free(*buf);
+    *buf = out;
+    *buf_len = new_total;
+    return 1;
+}
+
+/* ─────────────────── 签名必需的算法核心 ─────────────────── */
+
+/*
+ * inject_codesign_section — 注入 4KB 占位 .codesign 段 (签名第一步).
+ *
+ * 这是签名算法的必要组成部分, 流程如下:
+ *   1. 计算所有段末尾的最大值 cur_end = max(e_shoff+e_shnum*64, 各段 off+sz
+ *      [SHT_NOBITS 不计]), 段文件偏移 cs_off = align_up(cur_end, 4096)
+ *   2. 新 shstrtab = 旧 + ".codesign\0"; 落位 cs_off+4096
+ *   3. 新 SHT 落位新 shstrtab 之后 (8B 对齐), 复制旧 SHT, 追加 .codesign 条目
+ *      (sh_type=SHT_PROGBITS, sh_offset=cs_off, sh_size=4096, sh_addralign=4096)
+ *   4. 更新 shstrtab 条目偏移/大小, 更新 header e_shoff/e_shnum (e_shstrndx 不变)
+ *
+ * 关键差异: 只拷贝 [0, min(elf_len, cs_off)) 的原始内容, cs_off 之后到
+ * 新布局之间的区域全部保持 0 — 若输入文件在段末尾之外还拖着额外字节,
+ * 那些字节不进产物.
+ *
+ * 返回 0 成功, *out_len 为产物长度, *cs_off_out 为段文件偏移; -1 失败.
+ */
+static int inject_codesign_section(const uint8_t *elf, size_t elf_len,
+                                   uint8_t **out, size_t *out_len,
+                                   uint64_t *cs_off_out) {
+    uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
+    if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return -1;
+
+    /* shstrtab entry (用于取旧 shstr 内容) */
+    size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
+    uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
+    uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
+    if (shstr_off + shstr_sz > elf_len) {
+        fprintf(stderr, "error: shstrtab out of bounds\n");
+        return -1;
+    }
+
+    /* 1. cur_end: SHT 末尾与各段 off+sz 的最大值 (SHT_NOBITS=8 不占文件) */
+    uint64_t cur_end = e_shoff + (uint64_t)e_shnum * 64;
+    for (uint16_t i = 0; i < e_shnum; i++) {
+        size_t e = (size_t)e_shoff + (size_t)i * 64;
+        uint32_t sh_type = read_u32(elf, elf_len, e + 4);
+        uint64_t off = read_u64(elf, elf_len, e + 24);
+        uint64_t sz = sh_type == 8 ? 0 : read_u64(elf, elf_len, e + 32);
+        if (off + sz > cur_end) cur_end = off + sz;
+    }
+    uint64_t cs_off = align_up(cur_end, PAGE_SIZE);
+
+    /* 2. 新 shstrtab = 旧 + ".codesign\0" */
+    size_t name_len = sizeof(CODESIGN_NAME);
+    size_t new_shstr_sz = (size_t)shstr_sz + name_len;
+    uint8_t *new_shstr = malloc(new_shstr_sz);
+    if (!new_shstr) { fprintf(stderr, "error: out of memory\n"); return -1; }
+    memcpy(new_shstr, elf + shstr_off, (size_t)shstr_sz);
+    memcpy(new_shstr + shstr_sz, CODESIGN_NAME, name_len);
+    uint32_t cs_shname = (uint32_t)shstr_sz; /* .codesign 在新 shstrtab 内的偏移 */
+
+    /* 3. 新布局: 段在 cs_off, 新 shstrtab 在 cs_off+4096, 新 SHT 8B 对齐之后 */
+    uint64_t new_shstr_off = cs_off + PAGE_SIZE;
+    uint64_t new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8);
+    uint16_t new_shnum = e_shnum + 1;
+    size_t new_total = (size_t)new_sht_off + (size_t)new_shnum * 64;
+
+    uint8_t *buf = calloc(1, new_total);
+    if (!buf) { free(new_shstr); fprintf(stderr, "error: out of memory\n"); return -1; }
+
+    /* 4. 拷贝原内容: 只拷到 cs_off */
+    size_t copy_len = elf_len < new_total ? elf_len : new_total;
+    if (copy_len > cs_off) copy_len = (size_t)cs_off;
+    if (copy_len) memcpy(buf, elf, copy_len);
+    /* cs_off..cs_off+4096 为段占位 (calloc 全 0), 稍后写入 payload */
+
+    memcpy(buf + new_shstr_off, new_shstr, new_shstr_sz);
+    memcpy(buf + new_sht_off, elf + (size_t)e_shoff, (size_t)e_shnum * 64);
+    free(new_shstr);
+
+    /* .codesign 段条目 (64B) */
+    size_t cs_e = (size_t)new_sht_off + (size_t)e_shnum * 64;
+    write_u32(buf, cs_e + 0, cs_shname);            /* sh_name */
+    write_u32(buf, cs_e + 4, 1);                    /* sh_type = SHT_PROGBITS */
+    /* sh_flags/sh_addr 保持 0 */
+    write_u64(buf, cs_e + 24, cs_off);              /* sh_offset */
+    write_u64(buf, cs_e + 32, PAGE_SIZE);           /* sh_size */
+    /* sh_link/sh_info 保持 0 */
+    write_u64(buf, cs_e + 48, PAGE_SIZE);           /* sh_addralign */
+    /* sh_entsize 保持 0 */
+
+    /* 更新 shstrtab 条目偏移/大小 (在新 SHT 中的索引仍为 e_shstrndx) */
+    size_t shstr_e_new = (size_t)new_sht_off + (size_t)e_shstrndx * 64;
+    write_u64(buf, shstr_e_new + 24, new_shstr_off);
+    write_u64(buf, shstr_e_new + 32, new_shstr_sz);
+
+    /* 更新 header: e_shoff / e_shnum; e_shstrndx 不变 */
+    write_u64(buf, E_SHOFF, new_sht_off);
+    write_u16(buf, E_SHNUM, new_shnum);
+
+    *out = buf;
+    *out_len = new_total;
+    *cs_off_out = cs_off;
+    return 0;
+}
+
+/*
+ * merkle_root_hash — fs-verity Merkle 树根哈希 (签名必需).
+ *
+ * 与上游 merkle_tree_builder.cpp::RunHashTask 等价:
+ *   - 叶层: 每 4096B 一页 SHA-256, 末页零填充; 段所在页
+ *     [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) 的叶哈希全置 0
+ *   - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
+ *     整层 packed <= 4096, 补零后哈希即根
  */
 static void merkle_root_hash(const uint8_t *data, size_t len,
                              uint64_t cs_off, uint64_t cs_len,
@@ -149,15 +482,12 @@ static void merkle_root_hash(const uint8_t *data, size_t len,
     if (len == 0) {
         memset(page, 0, PAGE); sha256(page, PAGE, root); return;
     }
-    /* 叶层: 含段产物按原偏移分页, 段所在页哈希置0 */
     size_t npages = (len + PAGE - 1) / PAGE;
     uint8_t *cur = malloc(npages * H);
-    /* 段占用的页范围 [cs_off/PAGE, ceil((cs_off+cs_len)/PAGE)) */
     size_t cs_page_begin = (size_t)(cs_off / PAGE);
     size_t cs_page_end   = (size_t)((cs_off + cs_len + PAGE - 1) / PAGE);
     for (size_t i = 0; i < npages; i++) {
         if (cs_len > 0 && i >= cs_page_begin && i < cs_page_end) {
-            /* 段所在页: 叶哈希全填0 */
             memset(cur + i * H, 0, H);
             continue;
         }
@@ -192,19 +522,20 @@ static void merkle_root_hash(const uint8_t *data, size_t len,
     }
 }
 
-/* ─────────────────────── descriptor 与 ElfSignInfo ─────────────────────── */
 /*
- * descriptor 256 字节布局, 全小端.
+ * build_descriptor — 构造 256 字节 fs-verity descriptor (签名必需).
+ *
+ * 字段布局, 全小端:
  *   off  size  field
  *   0    1     version = 1
- *   1    1     hashAlgorithm = 1
- *   2    1     log2BlockSize = 12
+ *   1    1     hashAlgorithm = 1 (SHA-256)
+ *   2    1     log2BlockSize = 12 (4096)
  *   3    1     saltSize = 0
- *   4    4     signSize (摘要时=0, 落盘时=signature长)
+ *   4    4     signSize (摘要时=0, 落盘时=32)
  *   8    8     fileSize
- *   16   64    rootHash (左对齐, 余0)
- *   80   32    salt (全0)
- *   112  4     flags (自签名=0x10)
+ *   16   64    rootHash (32B 左对齐, 余 0)
+ *   80   32    salt (全 0)
+ *   112  4     flags = FLAG_SELF_SIGN 0x10
  *   116  4     reserved1 = 0
  *   120  8     merkleTreeOffset = 0
  *   128  127   reserved2 = 0
@@ -214,221 +545,211 @@ static void build_descriptor(uint8_t *out /*256*/,
                              uint32_t sign_size, uint64_t file_size,
                              const uint8_t root[32], uint32_t flags) {
     memset(out, 0, 256);
-    out[0] = 1;            /* version */
-    out[1] = 1;            /* hashAlgorithm SHA-256 */
-    out[2] = 12;           /* log2BlockSize */
-    out[3] = 0;            /* saltSize */
-    put_u32le(out + 4, sign_size);
-    put_u64le(out + 8, file_size);
-    memcpy(out + 16, root, 32);           /* rootHash 左对齐填64B后32B保持0 */
-    /* out+80 salt 全0 */
-    put_u32le(out + 112, flags);
-    /* out+116 reserved1=0; out+120 merkleTreeOffset=0; out+128 reserved2=0 */
-    out[255] = 3;          /* csVersion */
+    out[0] = 1;
+    out[1] = 1;
+    out[2] = 12;
+    out[3] = 0;
+    write_u32(out, 4, sign_size);
+    write_u64(out, 8, file_size);
+    memcpy(out + 16, root, 32);
+    write_u32(out, 112, flags);
+    out[255] = 3;
 }
 
-static const size_t DESC_SIZE = 256;
-static const size_t PAGE_SIZE = 4096;
-static const uint32_t FLAG_SELF_SIGN = 0x10;
-static const uint32_t FS_VERITY_DESCRIPTOR_TYPE = 1;
-
-/* ─────────────────────── ELF64 section 注入器 ─────────────────────── */
 /*
- * 自注入 .codesign 段到 ELF64 末尾, 段文件偏移 4KB 对齐, 段内容 4KB (全0占位),
- * 并更新 section header table + shstrtab. 与上游 binary-sign-tool 产物在段级等价.
+ * sign_elf — 签名主流程 (签名必需): 注入占位段 → merkle → descriptor →
+ * signature → 拼 payload 写入段内.
  *
- * 流程 (复刻上游 sign_elf.cpp::WriteCodeSignBlock):
- *   1. 解 ELF64 header 拿 e_shoff / e_shnum / e_shstrndx
- *   2. 定位 shstrtab 段, 在末尾追加 ".codesign\0"
- *   3. 算 .codesign 段文件偏移: 现有所有段末尾 max(段末) + 4KB 对齐
- *   4. 新 shstrtab 落到段后; 新 section header table 落到 shstrtab 后 (8B 对齐)
- *   5. 追加 .codesign entry: sh_type=SHT_PROGBITS, sh_addralign=4096, sh_size=4096
- *   6. 重写文件: 原内容[0..旧末尾] + .codesign段(4KB全0) + 新shstrtab + 新SHT
- *   7. 改 ELF header: e_shoff/e_shnum/e_shstrndx
- * 返回: .codesign 段在产物中的文件偏移 (4KB对齐), 通过 *cs_off_out.
+ *   - force == 0: 若已含 .codesign 段 → 报"已签名"错误
+ *   - force == 1: 先 strip_codesign 预清洗, 再签
+ *
+ * 返回 0 成功 (*out 为新产物); 返回 1 表示 already signed; 返回 -1 错误.
  */
-static uint64_t align_up(uint64_t v, uint64_t a) { return ((v + a - 1) / a) * a; }
-
-static int64_t inject_codesign_section(uint8_t *raw, size_t raw_len,
-                                        uint8_t **out, size_t *out_len,
-                                        uint64_t *cs_off_out) {
-    /* ELF64 header 字段偏移 */
-    const size_t E_SHOFF = 0x28, E_SHENTSIZE = 0x3a, E_SHNUM = 0x3c, E_SHSTRNDX = 0x3e;
-    if (raw_len < 64 || memcmp(raw, "\x7f""ELF", 4) != 0 || raw[4] != 2) {
-        fprintf(stderr, "not ELF64\n"); return -1;
-    }
-    uint64_t e_shoff   = *(uint64_t*)(raw + E_SHOFF);
-    uint16_t e_shnum   = *(uint16_t*)(raw + E_SHNUM);
-    uint16_t e_shstrndx= *(uint16_t*)(raw + E_SHSTRNDX);
-    if (e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum) {
-        fprintf(stderr, "no section header table (e_shoff=0?) — stripped ELF unsupported\n");
+static int sign_elf(const uint8_t *elf, size_t elf_len, int force,
+                    uint8_t **out, size_t *out_len) {
+    if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
+        fprintf(stderr, "error: not ELF64\n");
         return -1;
     }
-    /* shstrtab entry */
-    uint8_t *shstr_e = raw + e_shoff + (size_t)e_shstrndx * 64;
-    uint64_t shstr_off = *(uint64_t*)(shstr_e + 24);
-    uint64_t shstr_sz  = *(uint64_t*)(shstr_e + 32);
-    if (shstr_off + shstr_sz > raw_len) { fprintf(stderr, "shstrtab OOB\n"); return -1; }
-
-    /* 算 .codesign 段文件偏移: 所有段末尾 max(e_shoff + e_shnum*64, 各段 off+size) + 4KB 对齐 */
-    uint64_t cur_end = e_shoff + (uint64_t)e_shnum * 64;
-    for (uint16_t i = 0; i < e_shnum; i++) {
-        uint8_t *e = raw + e_shoff + (size_t)i * 64;
-        uint64_t off = *(uint64_t*)(e + 24), sz = *(uint64_t*)(e + 32);
-        if (e[4] == 8 /* SHT_NOBITS */) sz = 0;     /* .bss 等不占文件 */
-        if (off + sz > cur_end) cur_end = off + sz;
-    }
-    uint64_t cs_off = align_up(cur_end, PAGE_SIZE);
-
-    /* 新 shstrtab = 旧 shstrtab + ".codesign\0" */
-    static const char CS_NAME[] = ".codesign";
-    size_t name_len = strlen(CS_NAME) + 1;
-    uint64_t new_shstr_sz = shstr_sz + name_len;
-    uint8_t *new_shstr = malloc(new_shstr_sz);
-    memcpy(new_shstr, raw + shstr_off, shstr_sz);
-    memcpy(new_shstr + shstr_sz, CS_NAME, name_len);
-    uint32_t cs_shname = (uint32_t)shstr_sz;       /* .codesign 名字在新 shstrtab 内偏移 */
-
-    /* 新 shstrtab 落到段后 */
-    uint64_t new_shstr_off = cs_off + PAGE_SIZE;
-    /* 新 SHT 落到新 shstrtab 后, 8B 对齐 */
-    uint64_t new_sht_off = align_up(new_shstr_off + new_shstr_sz, 8);
-    uint16_t new_shnum = e_shnum + 1;
-    /* 新文件总长 */
-    size_t new_total = new_sht_off + (size_t)new_shnum * 64;
-
-    uint8_t *buf = calloc(1, new_total);
-    /* 1) 原内容 (含旧 SHT 在原位置; 旧 shstrtab 在原位置; ELF header 后面会被改) */
-    memcpy(buf, raw, raw_len);
-    /* 2) .codesign 段内容 (4KB 全0, 已 calloc) */
-    /* 3) 新 shstrtab (覆盖旧位置若重叠则无妨, 我们写到新位置) */
-    memcpy(buf + new_shstr_off, new_shstr, new_shstr_sz);
-    free(new_shstr);
-    /* 4) 旧 SHT 复制到新位置 */
-    memcpy(buf + new_sht_off, raw + e_shoff, (size_t)e_shnum * 64);
-    /* 5) 追加 .codesign entry (64B) */
-    uint8_t *cs_e = buf + new_sht_off + (size_t)e_shnum * 64;
-    memset(cs_e, 0, 64);
-    *(uint32_t*)(cs_e + 0)  = cs_shname;     /* sh_name */
-    *(uint32_t*)(cs_e + 4)  = 1;            /* sh_type SHT_PROGBITS */
-    *(uint64_t*)(cs_e + 8)  = 0;            /* sh_flags */
-    *(uint64_t*)(cs_e + 16) = 0;            /* sh_addr */
-    *(uint64_t*)(cs_e + 24) = cs_off;       /* sh_offset */
-    *(uint64_t*)(cs_e + 32) = PAGE_SIZE;    /* sh_size */
-    *(uint32_t*)(cs_e + 40) = 0;            /* sh_link */
-    *(uint32_t*)(cs_e + 44) = 0;            /* sh_info */
-    *(uint64_t*)(cs_e + 48) = PAGE_SIZE;    /* sh_addralign */
-    *(uint64_t*)(cs_e + 56) = 0;            /* sh_entsize */
-    /* 6) 改 shstrtab entry: 新 off + 新 size */
-    uint8_t *shstr_e_new = buf + new_sht_off + (size_t)e_shstrndx * 64;
-    *(uint64_t*)(shstr_e_new + 24) = new_shstr_off;
-    *(uint64_t*)(shstr_e_new + 32) = new_shstr_sz;
-    /* 7) 改 ELF header: e_shoff / e_shnum / e_shstrndx */
-    *(uint64_t*)(buf + E_SHOFF) = new_sht_off;
-    *(uint16_t*)(buf + E_SHNUM) = new_shnum;
-    /* e_shstrndx 不变 */
-
-    *out = buf; *out_len = new_total; *cs_off_out = cs_off;
-    return 0;
-}
-
-/* ─────────────────────────── 主流程 ─────────────────────────── */
-/*
- * 上游 sign_elf.cpp::Sign 流程复刻:
- *   1. 先剥旧 .codesign/.profile/.permission 段 (本实现假定输入未签, 跳过)
- *   2. 注入 4KB 占位 .codesign 段 → 含段产物 tmp
- *   3. fileSize = tmp 大小; csOffset = 段在 tmp 中的偏移
- *   4. 对 tmp 跳过段区间建 merkle 根哈希
- *   5. descriptor(signSize=0, fileSize=tmp大小) → SHA256 → signature
- *   6. 落盘 descriptor(signSize=32) + signature, 原地改写段内字节
- * 验签端按 section header 找 .codesign 段, 校验段偏移4KB对齐 + flags第4位.
- */
-static int self_sign(const char *inPath, const char *outPath) {
-    uint8_t *raw = NULL; size_t rawLen = 0;
-    if (read_file(inPath, &raw, &rawLen) < 0) return -1;
-
-    /* 0. 前置校验: 已含 .codesign 段则拒签 (本工具只加签, 不剥旧段).
-     *    反复签会累积段畸形, 验签侧按段名找到旧的不完整段会拒.
-     *    需重签时请先 llvm-objcopy --remove-section .codesign <elf> 剥旧段. */
-    {
-        uint64_t e_shoff = *(uint64_t*)(raw + 0x28);
-        uint16_t e_shnum = *(uint16_t*)(raw + 0x3c);
-        uint16_t e_shstrndx = *(uint16_t*)(raw + 0x3e);
-        if (e_shoff != 0 && e_shnum != 0 && e_shstrndx < e_shnum) {
-            uint8_t *shstr_e = raw + e_shoff + (size_t)e_shstrndx * 64;
-            uint64_t shstr_off = *(uint64_t*)(shstr_e + 24);
-            uint64_t shstr_sz  = *(uint64_t*)(shstr_e + 32);
-            if (shstr_off + shstr_sz <= rawLen) {
-                for (uint16_t i = 0; i < e_shnum; i++) {
-                    uint8_t *e = raw + e_shoff + (size_t)i * 64;
-                    uint32_t name_off = *(uint32_t*)(e + 0);
-                    if (name_off < shstr_sz &&
-                        strcmp((const char*)(raw + shstr_off + name_off), ".codesign") == 0) {
-                        fprintf(stderr,
-                            "error: %s already has a .codesign section.\n"
-            "  This tool only adds a signature, it does not strip old ones.\n"
-            "  To re-sign, first strip the old section with:\n"
-            "    llvm-objcopy --remove-section .codesign %s\n"
-            "  then run self-sign again.\n", inPath, inPath);
-                        free(raw); return -1;
-                    }
-                }
-            }
+    /* 预处理阶段: 已签名时按 force 决定报错或先清洗 */
+    uint8_t *buf = malloc(elf_len ? elf_len : 1);
+    if (!buf) { fprintf(stderr, "error: out of memory\n"); return -1; }
+    memcpy(buf, elf, elf_len);
+    size_t buf_len = elf_len;
+    int cleaned = 0;
+    if (has_codesign_section(buf, buf_len)) {
+        if (!force) {
+            free(buf);
+            fprintf(stderr, "error: already has a .codesign section; "
+                            "strip first or use --force\n");
+            return 1;
         }
+        cleaned = strip_codesign(&buf, &buf_len);
+        if (cleaned < 0) { free(buf); return -1; }
     }
 
-    /* 1. 注入 4KB 占位 .codesign 段 → tmp */
-    uint8_t *tmp = NULL; size_t tmpLen = 0; uint64_t csOff = 0;
-    if (inject_codesign_section(raw, rawLen, &tmp, &tmpLen, &csOff) < 0) {
-        free(raw); return -1;
+    /* 1. 注入 4KB 占位 .codesign 段 */
+    uint8_t *tmp = NULL; size_t tmp_len = 0; uint64_t cs_off = 0;
+    if (inject_codesign_section(buf, buf_len, &tmp, &tmp_len, &cs_off) < 0) {
+        free(buf); return -1;
     }
-    free(raw);
-    /* tmp 此时已含 4KB 占位段, 段内全0 */
+    free(buf);
 
-    /* 2. merkle 根哈希: 对 tmp 跳过 [csOff, csOff+4096) 区间建树 */
+    /* 2. merkle 根哈希: 跳过 [cs_off, cs_off+4096) */
     uint8_t root[32];
-    merkle_root_hash(tmp, tmpLen, csOff, PAGE_SIZE, root);
+    merkle_root_hash(tmp, tmp_len, cs_off, PAGE_SIZE, root);
 
-    /* 3/4. descriptor with signSize=0 用于摘要; fileSize = tmpLen */
+    /* 3/4. descriptor(signSize=0) 用于摘要, fileSize = 产物长度 */
     uint8_t desc_for_digest[256];
-    build_descriptor(desc_for_digest, 0, (uint64_t)tmpLen, root, FLAG_SELF_SIGN);
+    build_descriptor(desc_for_digest, 0, (uint64_t)tmp_len, root, FLAG_SELF_SIGN);
 
     /* 5. signature = SHA256(descriptor) */
     uint8_t signature[32];
     sha256(desc_for_digest, DESC_SIZE, signature);
 
-    /* 6. descriptor with signSize=32 用于落盘 */
+    /* 6. descriptor(signSize=32) 用于落盘 */
     uint8_t desc_on_disk[256];
-    build_descriptor(desc_on_disk, 32, (uint64_t)tmpLen, root, FLAG_SELF_SIGN);
+    build_descriptor(desc_on_disk, 32, (uint64_t)tmp_len, root, FLAG_SELF_SIGN);
 
-    /* 7. 拼 ElfSignInfo 头部 8B + descriptor 256B + signature 32B = 296B */
+    /* 7. ElfSignInfo: 8B 头 + descriptor 256B + signature 32B = 296B */
     uint8_t payload[8 + DESC_SIZE + 32];
-    put_u32le(payload + 0, FS_VERITY_DESCRIPTOR_TYPE);            /* type = 1 */
-    put_u32le(payload + 4, (uint32_t)(DESC_SIZE + 32));           /* length = 288 */
+    write_u32(payload, 0, FS_VERITY_DESCRIPTOR_TYPE);   /* type = 1 */
+    write_u32(payload, 4, (uint32_t)(DESC_SIZE + 32));  /* length = 288 */
     memcpy(payload + 8, desc_on_disk, DESC_SIZE);
     memcpy(payload + 8 + DESC_SIZE, signature, 32);
 
-    /* 8. 原地改写段内字节 (段从 csOff 开始, 段内放 payload) */
-    if (csOff + sizeof(payload) > tmpLen) {
-        free(tmp); return -1;
+    /* 8. 原地写入段内 */
+    if (cs_off + sizeof(payload) > tmp_len) { free(tmp); return -1; }
+    memcpy(tmp + cs_off, payload, sizeof(payload));
+
+    *out = tmp;
+    *out_len = tmp_len;
+    (void)cleaned;
+    return 0;
+}
+
+/* ─────────────────────────── 文件 I/O 层 ─────────────────────────── */
+
+/*
+ * sign_file_atomic — 对文件原子签名 (文件 I/O 层, 与签名算法无关).
+ *
+ * 签名结果先写入同目录临时文件
+ * ("<name>.ohos-signing.<pid>.tmp"), 成功后再 rename 覆盖原文件, 失败
+ * 时删除临时文件, 绝不损坏源文件; 同时保留原文件的权限位 (否则临时文件
+ * 默认 0644, 会剥掉可执行位).
+ *
+ * force: 0=已签名则报错; 1=先剥离再重签. 返回 0 成功, 非 0 失败.
+ */
+static int sign_file_atomic(const char *path, int force) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return -1; }
+    uint8_t *raw = malloc(sz > 0 ? (size_t)sz : 1);
+    if (!raw) { fclose(f); return -1; }
+    if (sz > 0 && fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return -1; }
+    fclose(f);
+
+    uint8_t *signed_buf = NULL; size_t signed_len = 0;
+    int rc = sign_elf(raw, (size_t)sz, force, &signed_buf, &signed_len);
+    free(raw);
+    if (rc != 0) return rc;
+
+    /* 保留原权限位 */
+    struct stat st;
+    mode_t mode = 0;
+    if (stat(path, &st) == 0) mode = st.st_mode & 07777;
+
+    char tmp_path[4096];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.ohos-signing.%ld.tmp",
+             path, (long)getpid());
+    remove(tmp_path);
+    f = fopen(tmp_path, "wb");
+    if (!f) { free(signed_buf); perror(tmp_path); return -1; }
+    if (signed_len && fwrite(signed_buf, 1, signed_len, f) != signed_len) {
+        fclose(f); remove(tmp_path); free(signed_buf); return -1;
     }
-    memcpy(tmp + csOff, payload, sizeof(payload));
-
-    /* 9. 落盘 */
-    if (write_file(outPath, tmp, tmpLen) < 0) { free(tmp); return -1; }
-
-    printf("self-sign ok: %s → %s (tmp=%zu, cs_off=0x%llx, payload=%zu)\n",
-           inPath, outPath, tmpLen, (unsigned long long)csOff, sizeof(payload));
-    free(tmp);
+    fclose(f);
+    if (mode) chmod(tmp_path, mode);
+    if (rename(tmp_path, path) != 0) {
+        remove(tmp_path); free(signed_buf); perror("rename"); return -1;
+    }
+    free(signed_buf);
     return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: %s <input_elf> [output_elf]\n  (output defaults to input, in-place)\n", argv[0]);
+    int force = 0, strip_only = 0;
+    const char *in_path = NULL, *out_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) force = 1;
+        else if (strcmp(argv[i], "--strip") == 0) strip_only = 1;
+        else if (!in_path) in_path = argv[i];
+        else if (!out_path) out_path = argv[i];
+        else { fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n", argv[0]); return 1; }
+    }
+    if (!in_path) {
+        fprintf(stderr, "usage: %s <input_elf> [output_elf] [--force] [--strip]\n"
+                "  (output defaults to input, in-place)\n", argv[0]);
         return 1;
     }
-    const char *inPath = argv[1];
-    const char *outPath = argc == 3 ? argv[2] : inPath;
-    return self_sign(inPath, outPath) == 0 ? 0 : 2;
+    if (!out_path) out_path = in_path;
+
+    if (strip_only) {
+        /* --strip: 仅预清洗/标准化, 不做签名 */
+        uint8_t *raw = NULL; size_t raw_len = 0;
+        FILE *f = fopen(in_path, "rb");
+        if (!f) { perror(in_path); return 2; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz < 0) { fclose(f); return 2; }
+        raw = malloc(sz > 0 ? (size_t)sz : 1);
+        if (!raw) { fclose(f); return 2; }
+        if (sz > 0 && fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return 2; }
+        fclose(f);
+        raw_len = (size_t)sz;
+        int rc = strip_codesign(&raw, &raw_len);
+        if (rc < 0) { free(raw); return 2; }
+        if (rc == 0) { printf("no .codesign section to strip: %s\n", in_path); free(raw); return 0; }
+        FILE *o = fopen(out_path, "wb");
+        if (!o) { free(raw); perror(out_path); return 2; }
+        if (raw_len && fwrite(raw, 1, raw_len, o) != raw_len) { fclose(o); free(raw); return 2; }
+        fclose(o);
+        free(raw);
+        printf("strip ok: %s → %s (%zu bytes)\n", in_path, out_path, raw_len);
+        return 0;
+    }
+
+    /* 默认/--force 签名: inplace 时走原子落盘, 否则直接写出 */
+    if (strcmp(in_path, out_path) == 0) {
+        int rc = sign_file_atomic(in_path, force);
+        if (rc == 1) return 3; /* already signed */
+        if (rc != 0) return 2;
+        printf("self-sign ok: %s (in-place, %s)\n", in_path, force ? "force" : "append-only");
+        return 0;
+    }
+    uint8_t *raw = NULL;
+    FILE *f = fopen(in_path, "rb");
+    if (!f) { perror(in_path); return 2; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return 2; }
+    raw = malloc(sz > 0 ? (size_t)sz : 1);
+    if (!raw) { fclose(f); return 2; }
+    if (sz > 0 && fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return 2; }
+    fclose(f);
+    uint8_t *signed_buf = NULL; size_t signed_len = 0;
+    int rc = sign_elf(raw, (size_t)sz, force, &signed_buf, &signed_len);
+    free(raw);
+    if (rc == 1) return 3;
+    if (rc != 0) return 2;
+    FILE *o = fopen(out_path, "wb");
+    if (!o) { free(signed_buf); perror(out_path); return 2; }
+    if (signed_len && fwrite(signed_buf, 1, signed_len, o) != signed_len) { fclose(o); free(signed_buf); return 2; }
+    fclose(o);
+    free(signed_buf);
+    printf("self-sign ok: %s → %s (%zu bytes)\n", in_path, out_path, signed_len);
+    return 0;
 }
+
+
