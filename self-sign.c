@@ -1,4 +1,12 @@
 /*
+ * Copyright (c) 2026 hqzing
+ * SPDX-License-Identifier: MIT
+ * Repository: https://github.com/hqzing/ohos-bst-light
+ *
+ * Licensed under the MIT License.
+ */
+
+/*
  * self-sign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
  *
  * ELF 解析做了健壮化 (字节读取 + 边界检查,
