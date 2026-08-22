@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 hqzing
-# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 hqzing
+# SPDX-License-Identifier: 0BSD
 # Repository: https://github.com/hqzing/ohos-bst-light
 #
-# Licensed under the MIT License.
+# Licensed under the BSD Zero Clause License.
 
 """
 self-sign.py — OpenHarmony 二进制自签名参考实现 (Python 3, 仅用标准库)

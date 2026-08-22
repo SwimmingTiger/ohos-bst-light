@@ -38,5 +38,19 @@ python3 self-sign.py <input_elf> [output_elf] [--force] [--strip]
 | `self-sign.c` | C 语言实现，自带 SHA-256 + ELF64 section 注入器 + 剥离器，零第三方依赖 |
 | `self-sign.py` | Python 实现，仅用标准库 hashlib/struct，零第三方依赖 |
 
+## 集成与分发
+
+本项目采用 BSD Zero Clause License 授权。它的核心设计理念是允许任意使用与修改，同时免除署名义务与法律责任。
+
+使用者在分发、修改或商业化代码时，无需在源代码、二进制文件或文档中保留原作者的版权声明。
+
+本项目的所有代码文件可以被无缝内嵌到任何开源项目（如 GPL、MIT、Apache 等）或闭源商业软件中，不会产生任何许可证冲突。
+
+## 许可证
+
+本项目采用 BSD Zero Clause License 授权。
+
+SPDX-License-Identifier: 0BSD
+
 ## 相关项目
 - [ohos-bst-portable](https://github.com/hqzing/ohos-bst-portable): 剥离官方源码独立编出 `binary-sign-tool`，产物与 OpenHarmony SDK 里集成的 `binary-sign-tool` 同源同质。此项目可以让开发者排除无关组件干扰、专注研究 `binary-sign-tool` 的代码逻辑。

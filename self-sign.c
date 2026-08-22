@@ -1,9 +1,9 @@
 /*
- * Copyright (c) 2026 hqzing
- * SPDX-License-Identifier: MIT
+ * Copyright (C) 2026 hqzing
+ * SPDX-License-Identifier: 0BSD
  * Repository: https://github.com/hqzing/ohos-bst-light
  *
- * Licensed under the MIT License.
+ * Licensed under the BSD Zero Clause License.
  */
 
 /*
