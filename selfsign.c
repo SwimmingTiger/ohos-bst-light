@@ -7,14 +7,14 @@
  */
 
 /*
- * self-sign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
+ * selfsign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
  *
  * ELF 解析做了健壮化 (字节读取 + 边界检查,
  * 不再依赖未对齐指针解引用, 并校验 e_shentsize/SHT 越界).
  *
  * 用法:
- *     cc self-sign.c -o self-sign
- *     ./self-sign <input_elf> [output_elf] [--force] [--strip]
+ *     cc selfsign.c -o selfsign
+ *     ./selfsign <input_elf> [output_elf] [--force] [--strip]
  *         缺省 output 时, inplace 改写 input.
  *         --force : 若已含 .codesign 段, 先剥离再重签
  *         --strip : 仅剥离 .codesign 段, 不做签名
@@ -734,7 +734,7 @@ int main(int argc, char **argv) {
         int rc = sign_file_atomic(in_path, force);
         if (rc == 1) return 3; /* already signed */
         if (rc != 0) return 2;
-        printf("self-sign ok: %s (in-place, %s)\n", in_path, force ? "force" : "append-only");
+        printf("selfsign ok: %s (in-place, %s)\n", in_path, force ? "force" : "append-only");
         return 0;
     }
     uint8_t *raw = NULL;
@@ -756,7 +756,7 @@ int main(int argc, char **argv) {
     if (signed_len && fwrite(signed_buf, 1, signed_len, o) != signed_len) { fclose(o); free(signed_buf); return 2; }
     fclose(o);
     free(signed_buf);
-    printf("self-sign ok: %s → %s (%zu bytes)\n", in_path, out_path, signed_len);
+    printf("selfsign ok: %s → %s (%zu bytes)\n", in_path, out_path, signed_len);
     return 0;
 }
 

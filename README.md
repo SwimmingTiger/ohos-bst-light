@@ -6,11 +6,11 @@
 
 ```sh
 # C 语言版（需编译，支持 gcc 和 clang）
-gcc self-sign.c -o self-sign
-./self-sign <input_elf> [output_elf] [--force] [--strip]
+gcc selfsign.c -o selfsign
+./selfsign <input_elf> [output_elf] [--force] [--strip]
 
 # Python 版（仅标准库）
-python3 self-sign.py <input_elf> [output_elf] [--force] [--strip]
+python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
 ```
 
 参数说明：
@@ -25,18 +25,18 @@ python3 self-sign.py <input_elf> [output_elf] [--force] [--strip]
 示例：
 
 ```sh
-./self-sign mybin                    # 签名（原地处理）
-./self-sign mybin mybin.signed       # 签名到新文件
-./self-sign --force mybin            # 强制重签
-./self-sign --strip mybin            # 剥离签名
+./selfsign mybin                    # 签名（原地处理）
+./selfsign mybin mybin.signed       # 签名到新文件
+./selfsign --force mybin            # 强制重签
+./selfsign --strip mybin            # 剥离签名
 ```
 
 ## 文件
 
 | 文件 | 用途 |
 |------|------|
-| `self-sign.c` | C 语言实现，自带 SHA-256 + ELF64 section 注入器 + 剥离器，零第三方依赖 |
-| `self-sign.py` | Python 实现，仅用标准库 hashlib/struct，零第三方依赖 |
+| `selfsign.c` | C 语言实现，自带 SHA-256 + ELF64 section 注入器 + 剥离器，零第三方依赖 |
+| `selfsign.py` | Python 实现，仅用标准库 hashlib/struct，零第三方依赖 |
 
 ## 集成与分发
 
