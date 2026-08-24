@@ -238,7 +238,8 @@ static int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
     size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
     uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
     uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
-    if (shstr_off + shstr_sz > elf_len) return -1;
+    /* 用减法形式避免 shstr_off + shstr_sz 回绕 */
+    if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) return -1;
     for (uint16_t i = 0; i < e_shnum; i++) {
         size_t e = (size_t)e_shoff + (size_t)i * 64;
         uint32_t name_off = read_u32(elf, elf_len, e);
@@ -306,7 +307,7 @@ static int strip_codesign(uint8_t **buf, size_t *buf_len) {
     size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
     size_t shstr_off = (size_t)read_u64(elf, elf_len, shstr_e + 24);
     size_t shstr_sz = (size_t)read_u64(elf, elf_len, shstr_e + 32);
-    if (shstr_off + shstr_sz > elf_len) {
+    if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) {
         fprintf(stderr, "error: shstrtab out of bounds\n");
         return -1;
     }
@@ -403,7 +404,7 @@ static int inject_codesign_section(const uint8_t *elf, size_t elf_len,
     size_t shstr_e = (size_t)e_shoff + (size_t)e_shstrndx * 64;
     uint64_t shstr_off = read_u64(elf, elf_len, shstr_e + 24);
     uint64_t shstr_sz = read_u64(elf, elf_len, shstr_e + 32);
-    if (shstr_off + shstr_sz > elf_len) {
+    if (shstr_off > elf_len || shstr_sz > elf_len - shstr_off) {
         fprintf(stderr, "error: shstrtab out of bounds\n");
         return -1;
     }
