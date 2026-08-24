@@ -1,16 +1,29 @@
 # ohos-bst-light
 
-`binary-sign-tool` 轻量重写版 —— 基于 `binary-sign-tool` 开源代码逆向分析出二进制自签名算法后，用 C 语言和 Python 各重写一份签名工具实现。
+`binary-sign-tool` 轻量重写版 —— 基于 `binary-sign-tool` 开源代码逆向分析出二进制自签名算法后，用多种语言分别重写签名工具实现。
 
 ## 用法
+
+各版本命令行参数完全一致：
 
 ```sh
 # C 语言版（需编译，支持 gcc 和 clang）
 gcc selfsign.c -o selfsign
 ./selfsign <input_elf> [output_elf] [--force] [--strip]
 
-# Python 版（仅标准库）
+# Python 版
 python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
+
+# JavaScript 版（Node.js）
+node selfsign.js <input_elf> [output_elf] [--force] [--strip]
+
+# Rust 版（需编译）
+rustc -O selfsign.rs -o selfsign
+./selfsign <input_elf> [output_elf] [--force] [--strip]
+
+# Go 版（需编译）
+go build -o selfsign selfsign.go
+./selfsign <input_elf> [output_elf] [--force] [--strip]
 ```
 
 参数说明：
@@ -37,6 +50,11 @@ python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
 |------|------|
 | `selfsign.c` | C 语言实现，自带 SHA-256 + ELF64 section 注入器 + 剥离器，零第三方依赖 |
 | `selfsign.py` | Python 实现，仅用标准库 hashlib/struct，零第三方依赖 |
+| `selfsign.js` | JavaScript (Node.js) 实现，仅用内置模块 crypto，零第三方依赖 |
+| `selfsign.rs` | Rust 实现，仅用标准库，自带 SHA-256，零第三方依赖 |
+| `selfsign.go` | Go 实现，仅用标准库 crypto/sha256，零第三方依赖 |
+
+各版本对同一 ELF 输入产生字节级一致的签名结果。
 
 ## 集成与分发
 

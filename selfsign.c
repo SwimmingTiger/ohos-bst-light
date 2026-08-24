@@ -9,9 +9,6 @@
 /*
  * selfsign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
  *
- * ELF 解析做了健壮化 (字节读取 + 边界检查,
- * 不再依赖未对齐指针解引用, 并校验 e_shentsize/SHT 越界).
- *
  * 用法:
  *     cc selfsign.c -o selfsign
  *     ./selfsign <input_elf> [output_elf] [--force] [--strip]

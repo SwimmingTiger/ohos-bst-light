@@ -8,9 +8,6 @@
 """
 selfsign.py — OpenHarmony 二进制自签名参考实现 (Python 3, 仅用标准库)
 
-ELF 解析做了健壮化 (显式边界检查 +
-e_shentsize 校验, 对齐 C 版 selfsign.c 的结构).
-
 用法:
     python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]
         缺省 output 时, inplace 改写 input.
