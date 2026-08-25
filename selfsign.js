@@ -471,4 +471,26 @@ function main() {
   return 0;
 }
 
-process.exit(main());
+// 作为库被 require 时不自动执行 main；
+// 仅在直接 `node selfsign.js` 时跑命令行入口。
+if (require.main === module) {
+  process.exit(main());
+}
+
+// ─────────────────── 库导出 ───────────────────
+// 导出这些函数，使本文件既可作为命令行工具直接运行，
+// 也可作为模块被其他脚本 require 引用。
+module.exports = {
+  // 高层 API
+  signElf,           // (elf: Buffer, force?: boolean) => Buffer
+  signFileAtomic,    // (path: string, force?: boolean) => void  原子原地签名
+  // 段操作
+  stripCodesign,     // (buf: Buffer) => { removed: boolean, out: Buffer }
+  hasCodesignSection,// (elf: Buffer) => boolean
+  injectCodesignSection, // (elf: Buffer) => { out: Buffer, cs_off: number }
+  // 算法核心（导出便于复用/测试）
+  merkleRootHash,
+  buildDescriptor,
+  parseElfHeader,
+  findSectionByName,
+};
