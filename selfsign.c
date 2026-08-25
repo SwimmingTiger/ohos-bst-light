@@ -195,7 +195,7 @@ static const char CODESIGN_NAME[10] = ".codesign\0";
  * 返回 0 表示通过, 输出 e_shoff/e_shnum/e_shstrndx; 返回 -1 表示不是
  * 可处理的 ELF64.
  */
-static int parse_elf_header(const uint8_t *elf, size_t elf_len,
+int parse_elf_header(const uint8_t *elf, size_t elf_len,
                             uint64_t *e_shoff, uint16_t *e_shnum,
                             uint16_t *e_shstrndx) {
     if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
@@ -228,7 +228,7 @@ static int parse_elf_header(const uint8_t *elf, size_t elf_len,
  * 比较 sh_name 指向的名字.
  * 返回段条目在文件中的偏移 (即 e_shoff + idx*64), 未找到返回 -1.
  */
-static int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
+int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
                                     uint64_t e_shoff, uint16_t e_shnum,
                                     uint16_t e_shstrndx, const char *name) {
     size_t name_len = strlen(name) + 1; /* 含 NUL */
@@ -256,7 +256,7 @@ static int64_t find_section_by_name(const uint8_t *elf, size_t elf_len,
  *   - 纯加签模式: 已含则直接报"已签名"错误
  *   - --force 模式: 已含则先走 strip_codesign 再签
  */
-static int has_codesign_section(const uint8_t *elf, size_t elf_len) {
+int has_codesign_section(const uint8_t *elf, size_t elf_len) {
     uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
     if (parse_elf_header(elf, elf_len, &e_shoff, &e_shnum, &e_shstrndx) < 0) return 0;
     return find_section_by_name(elf, elf_len, e_shoff, e_shnum, e_shstrndx,
@@ -289,7 +289,7 @@ static uint16_t new_shstrndx(uint16_t old_shstrndx, size_t cs_idx) {
  * 入参 *buf / *buf_len 会被原地改写 (可能 realloc).
  * 返回 1 = 已剥离; 0 = 本来就没有 .codesign; -1 = 错误.
  */
-static int strip_codesign(uint8_t **buf, size_t *buf_len) {
+int strip_codesign(uint8_t **buf, size_t *buf_len) {
     uint8_t *elf = *buf;
     size_t elf_len = *buf_len;
     uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
@@ -391,7 +391,7 @@ static int strip_codesign(uint8_t **buf, size_t *buf_len) {
  *
  * 返回 0 成功, *out_len 为产物长度, *cs_off_out 为段文件偏移; -1 失败.
  */
-static int inject_codesign_section(const uint8_t *elf, size_t elf_len,
+int inject_codesign_section(const uint8_t *elf, size_t elf_len,
                                    uint8_t **out, size_t *out_len,
                                    uint64_t *cs_off_out) {
     uint64_t e_shoff; uint16_t e_shnum, e_shstrndx;
@@ -480,7 +480,7 @@ static int inject_codesign_section(const uint8_t *elf, size_t elf_len,
  *   - 上推: 每页打包 128 个 32B 哈希再 SHA-256, 末页零填充, 直到
  *     整层 packed <= 4096, 补零后哈希即根
  */
-static void merkle_root_hash(const uint8_t *data, size_t len,
+void merkle_root_hash(const uint8_t *data, size_t len,
                              uint64_t cs_off, uint64_t cs_len,
                              uint8_t root[32]) {
     const size_t PAGE = 4096, H = 32;
@@ -547,7 +547,7 @@ static void merkle_root_hash(const uint8_t *data, size_t len,
  *   128  127   reserved2 = 0
  *   255  1     csVersion = 3
  */
-static void build_descriptor(uint8_t *out /*256*/,
+void build_descriptor(uint8_t *out /*256*/,
                              uint32_t sign_size, uint64_t file_size,
                              const uint8_t root[32], uint32_t flags) {
     memset(out, 0, 256);
@@ -571,7 +571,7 @@ static void build_descriptor(uint8_t *out /*256*/,
  *
  * 返回 0 成功 (*out 为新产物); 返回 1 表示 already signed; 返回 -1 错误.
  */
-static int sign_elf(const uint8_t *elf, size_t elf_len, int force,
+int sign_elf(const uint8_t *elf, size_t elf_len, int force,
                     uint8_t **out, size_t *out_len) {
     if (elf_len < 64 || memcmp(elf, "\x7f""ELF", 4) != 0 || elf[4] != 2) {
         fprintf(stderr, "error: not ELF64\n");
@@ -646,7 +646,7 @@ static int sign_elf(const uint8_t *elf, size_t elf_len, int force,
  *
  * force: 0=已签名则报错; 1=先剥离再重签. 返回 0 成功, 非 0 失败.
  */
-static int sign_file_atomic(const char *path, int force) {
+int sign_file_atomic(const char *path, int force) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     fseek(f, 0, SEEK_END);
@@ -686,6 +686,14 @@ static int sign_file_atomic(const char *path, int force) {
     return 0;
 }
 
+/*
+ * 条件编译宏 SELFSIGN_AS_LIBRARY:
+ *   定义时跳过 main, 将本文件编译为库:
+ *     gcc -DSELFSIGN_AS_LIBRARY -fPIC -shared selfsign.c -o libselfsign.so
+ *   未定义时编译为普通命令行可执行程序:
+ *     gcc selfsign.c -o selfsign
+ */
+#ifndef SELFSIGN_AS_LIBRARY
 int main(int argc, char **argv) {
     int force = 0, strip_only = 0;
     const char *in_path = NULL, *out_path = NULL;
@@ -757,5 +765,4 @@ int main(int argc, char **argv) {
     printf("selfsign ok: %s → %s (%zu bytes)\n", in_path, out_path, signed_len);
     return 0;
 }
-
-
+#endif
