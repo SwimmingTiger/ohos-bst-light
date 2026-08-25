@@ -7,7 +7,7 @@
  */
 
 /*
- * selfsign.c — OpenHarmony 二进制自签名参考实现 (C99, 无第三方依赖)
+ * selfsign.c — 轻量级 OpenHarmony 二进制自签名工具
  *
  * 用法:
  *     cc selfsign.c -o selfsign

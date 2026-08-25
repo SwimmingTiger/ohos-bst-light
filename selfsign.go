@@ -5,7 +5,7 @@
 // Licensed under the BSD Zero Clause License.
 
 /*
- * selfsign.go — OpenHarmony 二进制自签名参考实现 (Go, 仅用标准库)
+ * selfsign.go — 轻量级 OpenHarmony 二进制自签名工具
  *
  * 用法:
  *     go build -o selfsign selfsign.go

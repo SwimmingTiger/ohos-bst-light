@@ -6,7 +6,7 @@
 # Licensed under the BSD Zero Clause License.
 
 """
-selfsign.py — OpenHarmony 二进制自签名参考实现 (Python 3, 仅用标准库)
+selfsign.py — 轻量级 OpenHarmony 二进制自签名工具
 
 用法:
     python3 selfsign.py <input_elf> [output_elf] [--force] [--strip]

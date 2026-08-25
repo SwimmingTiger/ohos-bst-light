@@ -5,7 +5,7 @@
 // Licensed under the BSD Zero Clause License.
 
 /*
- * selfsign.rs — OpenHarmony 二进制自签名参考实现 (Rust, 仅用标准库, 自带 SHA-256)
+ * selfsign.rs — 轻量级 OpenHarmony 二进制自签名工具
  *
  * 用法:
  *     rustc -O selfsign.rs -o selfsign
